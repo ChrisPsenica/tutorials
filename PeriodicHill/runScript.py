@@ -11,14 +11,15 @@ import argparse
 import numpy as np
 from mpi4py import MPI
 import openmdao.api as om
-from mphys.multipoint import Multipoint
+from mphys.core import Multipoint
+from mphys import MPhysVariables
 from dafoam.mphys import DAFoamBuilder, OptFuncs
-from mphys.scenario_aerodynamic import ScenarioAerodynamic
+from mphys.scenarios import ScenarioAerodynamic
 
 
 parser = argparse.ArgumentParser()
 # which optimizer to use. Options are: IPOPT (default), SLSQP, and SNOPT
-parser.add_argument("-optimizer", help="optimizer to use", type=str, default="IPOPT")
+parser.add_argument("-optimizer", help="optimizer to use", type=str, default="Uno")
 # which task to run. Options are: run_driver (default), run_model, compute_totals, check_totals
 parser.add_argument("-task", help="type of run to do", type=str, default="run_driver")
 args = parser.parse_args()
@@ -142,11 +143,27 @@ if args.optimizer == "SNOPT":
         "Print file": "opt_SNOPT_print.txt",
         "Summary file": "opt_SNOPT_summary.txt",
     }
+elif args.optimizer == "Uno":
+    prob.driver.opt_settings = {
+        "preset": "filtersqp",
+        "globalization_mechanism": "LS",
+        "LS_backtracking_ratio": 0.5,
+        "globalization_strategy": "merit_function",
+        "hessian_model": "LBFGS",
+        "max_iterations": 100,
+        "primal_tolerance": 1e-4,
+        "loose_primal_tolerance": 1e-3,
+        "dual_tolerance": 1e-4,
+        "loose_dual_tolerance": 1e-3,
+        "quasi_newton_memory_size": 50,
+        "logger": "INFO",
+        "logger_stream": "opt_Uno.txt",
+    }
 elif args.optimizer == "IPOPT":
     prob.driver.opt_settings = {
         "tol": 1.0e-5,
         "constr_viol_tol": 1.0e-5,
-        "max_iter": 50,
+        "max_iter": 100,
         "print_level": 5,
         "output_file": "opt_IPOPT.txt",
         "mu_strategy": "adaptive",

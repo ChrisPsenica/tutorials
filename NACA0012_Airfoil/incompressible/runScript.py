@@ -12,15 +12,15 @@ import numpy as np
 import json
 from mpi4py import MPI
 import openmdao.api as om
-from mphys.multipoint import Multipoint
+from mphys.core import Multipoint
+from mphys import MPhysVariables
 from dafoam.mphys import DAFoamBuilder, OptFuncs
-from mphys.scenario_aerodynamic import ScenarioAerodynamic
+from mphys.scenarios import ScenarioAerodynamic
 from pygeo.mphys import OM_DVGEOCOMP
-
 
 parser = argparse.ArgumentParser()
 # which optimizer to use. Options are: IPOPT (default), SLSQP, and SNOPT
-parser.add_argument("-optimizer", help="optimizer to use", type=str, default="IPOPT")
+parser.add_argument("-optimizer", help="optimizer to use", type=str, default="Uno")
 # which task to run. Options are: run_driver (default), run_model, compute_totals, check_totals
 parser.add_argument("-task", help="type of run to do", type=str, default="run_driver")
 args = parser.parse_args()
@@ -66,7 +66,11 @@ daOptions = {
             "scale": 1.0 / (0.5 * U0 * U0 * A0 * rho0),
         },
     },
-    "adjEqnOption": {"gmresRelTol": 1.0e-6, "pcFillLevel": 1, "jacMatReOrdering": "rcm"},
+    "adjEqnOption": {
+        "gmresRelTol": 1.0e-6,
+        "pcFillLevel": 1,
+        "jacMatReOrdering": "rcm",
+    },
     "normalizeStates": {
         "U": U0,
         "p": U0 * U0 / 2.0,
@@ -90,7 +94,10 @@ meshOptions = {
     "gridFile": os.getcwd(),
     "fileType": "OpenFOAM",
     # point and normal for the symmetry plane
-    "symmetryPlanes": [[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], [[0.0, 0.0, 0.1], [0.0, 0.0, 1.0]]],
+    "symmetryPlanes": [
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        [[0.0, 0.0, 0.1], [0.0, 0.0, 1.0]],
+    ],
 }
 
 
@@ -113,14 +120,16 @@ class Top(Multipoint):
 
         # add a scenario (flow condition) for optimization, we pass the builder
         # to the scenario to actually run the flow and adjoint
-        self.mphys_add_scenario("scenario1", ScenarioAerodynamic(aero_builder=dafoam_builder))
+        self.mphys_add_scenario(
+            "scenario1", ScenarioAerodynamic(aero_builder=dafoam_builder)
+        )
 
         # need to manually connect the x_aero0 between the mesh and geometry components
         # here x_aero0 means the surface coordinates of structurally undeformed mesh
-        self.connect("mesh.x_aero0", "geometry.x_aero_in")
+        self.connect("mesh.x_aero0", "geometry.x_aero0_geometry_input")
         # need to manually connect the x_aero0 between the geometry component and the scenario1
         # scenario group
-        self.connect("geometry.x_aero0", "scenario1.x_aero")
+        self.connect("geometry.x_aero0_geometry_output", "scenario1.x_aero")
 
     def configure(self):
 
@@ -128,14 +137,16 @@ class Top(Multipoint):
         points = self.mesh.mphys_get_surface_mesh()
 
         # add pointset to the geometry component
-        self.geometry.nom_add_discipline_coords("aero", points)
+        self.geometry.nom_add_discipline_coords(
+            MPhysVariables.Aerodynamics.Surface.Geometry, points
+        )
 
         # set the triangular points to the geometry component for geometric constraints
         tri_points = self.mesh.mphys_get_triangulated_surface()
         self.geometry.nom_setConstraintSurface(tri_points)
 
         # use the shape function to define shape variables for 2D airfoil
-        pts = self.geometry.DVGeo.getLocalIndex(0)
+        pts = self.geometry.nom_getDVGeo().getLocalIndex(0)
         dir_y = np.array([0.0, 1.0, 0.0])
         shapes = []
         for i in range(1, pts.shape[0] - 1):
@@ -145,15 +156,28 @@ class Top(Multipoint):
         # LE/TE shape, the j=0 and j=1 move in opposite directions so that
         # the LE/TE are fixed
         for i in [0, pts.shape[0] - 1]:
-            shapes.append({pts[i, 0, 0]: dir_y, pts[i, 0, 1]: dir_y, pts[i, 1, 0]: -dir_y, pts[i, 1, 1]: -dir_y})
+            shapes.append(
+                {
+                    pts[i, 0, 0]: dir_y,
+                    pts[i, 0, 1]: dir_y,
+                    pts[i, 1, 0]: -dir_y,
+                    pts[i, 1, 1]: -dir_y,
+                }
+            )
         self.geometry.nom_addShapeFunctionDV(dvName="shape", shapes=shapes)
 
         # setup the volume and thickness constraints
         leList = [[1e-4, 0.0, 1e-4], [1e-4, 0.0, 0.1 - 1e-4]]
         teList = [[0.998 - 1e-4, 0.0, 1e-4], [0.998 - 1e-4, 0.0, 0.1 - 1e-4]]
-        self.geometry.nom_addThicknessConstraints2D("thickcon", leList, teList, nSpan=2, nChord=10)
-        self.geometry.nom_addVolumeConstraint("volcon", leList, teList, nSpan=2, nChord=10)
-        self.geometry.nom_addLERadiusConstraints("rcon", leList, 2, [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0])
+        self.geometry.nom_addThicknessConstraints2D(
+            "thickcon", leList, teList, nSpan=2, nChord=10
+        )
+        self.geometry.nom_addVolumeConstraint(
+            "volcon", leList, teList, nSpan=2, nChord=10
+        )
+        self.geometry.nom_addLERadiusConstraints(
+            "rcon", leList, 2, [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]
+        )
         # NOTE: we no longer need to define the sym and LE/TE constraints
         # because these constraints are defined in the above shape function
 
@@ -202,6 +226,22 @@ if args.optimizer == "SNOPT":
         "Print file": "opt_SNOPT_print.txt",
         "Summary file": "opt_SNOPT_summary.txt",
     }
+elif args.optimizer == "Uno":
+    prob.driver.opt_settings = {
+        "preset": "filtersqp",
+        "globalization_mechanism": "LS",
+        "LS_backtracking_ratio": 0.5,
+        "globalization_strategy": "merit_function",
+        "hessian_model": "LBFGS",
+        "max_iterations": 100,
+        "primal_tolerance": 1e-4,
+        "loose_primal_tolerance": 1e-3,
+        "dual_tolerance": 1e-4,
+        "loose_dual_tolerance": 1e-3,
+        "quasi_newton_memory_size": 50,
+        "logger": "INFO",
+        "logger_stream": "opt_Uno.txt",
+    }
 elif args.optimizer == "IPOPT":
     prob.driver.opt_settings = {
         "tol": 1.0e-5,
@@ -231,7 +271,9 @@ prob.driver.hist_file = "OptView.hst"
 
 if args.task == "run_driver":
     # solve CL
-    optFuncs.findFeasibleDesign(["scenario1.aero_post.CL"], ["patchV"], targets=[CL_target], designVarsComp=[1])
+    optFuncs.findFeasibleDesign(
+        ["scenario1.aero_post.CL"], ["patchV"], targets=[CL_target], designVarsComp=[1]
+    )
     # run the optimization
     prob.run_driver()
 elif args.task == "run_model":

@@ -1,12 +1,6 @@
 #!/usr/bin/env python
 """
-DAFoam run script for the NACA0012 airfoil at low-speed with a static stability constraint
-Here we use the forward finite-difference method to compute dCMZ/dAOA and its derivs
-
-Reference:
-Lyu and Martins. Aerodynamic Design Optimization Studies of a Blended-Wing-Body Aircraft.
-Journal of Aircraft. 2014
-
+DAFoam run script for the NACA0012 airfoil at low-speed
 """
 
 # =============================================================================
@@ -15,18 +9,19 @@ Journal of Aircraft. 2014
 import os
 import argparse
 import numpy as np
+import json
 from mpi4py import MPI
 import openmdao.api as om
-from mphys.multipoint import Multipoint
+from mphys.core import Multipoint
+from mphys import MPhysVariables
 from dafoam.mphys import DAFoamBuilder, OptFuncs
-from mphys.scenario_aerodynamic import ScenarioAerodynamic
+from mphys.scenarios import ScenarioAerodynamic
 from pygeo.mphys import OM_DVGEOCOMP
-from pygeo import geo_utils
-
+from openmdao.drivers.modopt_driver import modOptDriver
 
 parser = argparse.ArgumentParser()
 # which optimizer to use. Options are: IPOPT (default), SLSQP, and SNOPT
-parser.add_argument("-optimizer", help="optimizer to use", type=str, default="IPOPT")
+parser.add_argument("-optimizer", help="optimizer to use", type=str, default="Egor")
 # which task to run. Options are: run_driver (default), run_model, compute_totals, check_totals
 parser.add_argument("-task", help="type of run to do", type=str, default="run_driver")
 args = parser.parse_args()
@@ -38,10 +33,8 @@ U0 = 10.0
 p0 = 0.0
 nuTilda0 = 4.5e-5
 CL_target = 0.5
-CMZ_upper = -0.002
-aoa0 = 5.1385655
+aoa0 = 5.13918623195176
 A0 = 0.1
-L0 = 1.0
 # rho is used for normalizing CD and CL
 rho0 = 1.0
 
@@ -49,7 +42,7 @@ rho0 = 1.0
 daOptions = {
     "designSurfaces": ["wing"],
     "solverName": "DASimpleFoam",
-    "primalMinResTol": 1.0e-9,
+    "primalMinResTol": 1.0e-8,
     "primalBC": {
         "U0": {"variable": "U", "patches": ["inout"], "value": [U0, 0.0, 0.0]},
         "p0": {"variable": "p", "patches": ["inout"], "value": [p0]},
@@ -73,17 +66,12 @@ daOptions = {
             "patchVelocityInputName": "patchV",
             "scale": 1.0 / (0.5 * U0 * U0 * A0 * rho0),
         },
-        "CMZ": {
-            "type": "moment",
-            "source": "patchToFace",
-            "patches": ["wing"],
-            "axis": [0.0, 0.0, 1.0],
-            "center": [0.25, 0.0, 0.05],
-            # NOTE. We scale it with -1 because DAFoam's CMZ calculation is positive for nose down
-            "scale": -1.0 / (0.5 * U0 * U0 * A0 * L0),
-        },
     },
-    "adjEqnOption": {"gmresRelTol": 1.0e-6, "pcFillLevel": 1, "jacMatReOrdering": "rcm"},
+    "adjEqnOption": {
+        "gmresRelTol": 1.0e-6,
+        "pcFillLevel": 1,
+        "jacMatReOrdering": "rcm",
+    },
     "normalizeStates": {
         "U": U0,
         "p": U0 * U0 / 2.0,
@@ -107,7 +95,10 @@ meshOptions = {
     "gridFile": os.getcwd(),
     "fileType": "OpenFOAM",
     # point and normal for the symmetry plane
-    "symmetryPlanes": [[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]], [[0.0, 0.0, 0.1], [0.0, 0.0, 1.0]]],
+    "symmetryPlanes": [
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        [[0.0, 0.0, 0.1], [0.0, 0.0, 1.0]],
+    ],
 }
 
 
@@ -130,30 +121,16 @@ class Top(Multipoint):
 
         # add a scenario (flow condition) for optimization, we pass the builder
         # to the scenario to actually run the flow and adjoint
-        self.mphys_add_scenario("cruise", ScenarioAerodynamic(aero_builder=dafoam_builder))
-        # cruise_delta is the flow condition with aoa + 0.01. We will then use the
-        # FD method to compute stability obj and derivs
-        self.mphys_add_scenario("cruise_delta", ScenarioAerodynamic(aero_builder=dafoam_builder))
+        self.mphys_add_scenario(
+            "scenario1", ScenarioAerodynamic(aero_builder=dafoam_builder)
+        )
 
         # need to manually connect the x_aero0 between the mesh and geometry components
         # here x_aero0 means the surface coordinates of structurally undeformed mesh
-        self.connect("mesh.x_aero0", "geometry.x_aero_in")
-        # need to manually connect the x_aero0 between the geometry component and the cruise
+        self.connect("mesh.x_aero0", "geometry.x_aero0_geometry_input")
+        # need to manually connect the x_aero0 between the geometry component and the scenario1
         # scenario group
-        self.connect("geometry.x_aero0", "cruise.x_aero")
-        self.connect("geometry.x_aero0", "cruise_delta.x_aero")
-
-        # define the stability function. Here we use the forward FD with a step size of 0.01
-        self.add_subsystem("dCMZdAOA", om.ExecComp("val=(CMZ_delta - CMZ)/0.01"))
-        self.add_subsystem(
-            "patchVDelta",
-            om.ExecComp(
-                "val=patchV_delta-patchV",
-                val=np.zeros(2),
-                patchV=np.zeros(2),
-                patchV_delta=np.zeros(2),
-            ),
-        )
+        self.connect("geometry.x_aero0_geometry_output", "scenario1.x_aero")
 
     def configure(self):
 
@@ -161,14 +138,16 @@ class Top(Multipoint):
         points = self.mesh.mphys_get_surface_mesh()
 
         # add pointset to the geometry component
-        self.geometry.nom_add_discipline_coords("aero", points)
+        self.geometry.nom_add_discipline_coords(
+            MPhysVariables.Aerodynamics.Surface.Geometry, points
+        )
 
         # set the triangular points to the geometry component for geometric constraints
         tri_points = self.mesh.mphys_get_triangulated_surface()
         self.geometry.nom_setConstraintSurface(tri_points)
 
         # use the shape function to define shape variables for 2D airfoil
-        pts = self.geometry.DVGeo.getLocalIndex(0)
+        pts = self.geometry.nom_getDVGeo().getLocalIndex(0)
         dir_y = np.array([0.0, 1.0, 0.0])
         shapes = []
         for i in range(1, pts.shape[0] - 1):
@@ -178,45 +157,49 @@ class Top(Multipoint):
         # LE/TE shape, the j=0 and j=1 move in opposite directions so that
         # the LE/TE are fixed
         for i in [0, pts.shape[0] - 1]:
-            shapes.append({pts[i, 0, 0]: dir_y, pts[i, 0, 1]: dir_y, pts[i, 1, 0]: -dir_y, pts[i, 1, 1]: -dir_y})
+            shapes.append(
+                {
+                    pts[i, 0, 0]: dir_y,
+                    pts[i, 0, 1]: dir_y,
+                    pts[i, 1, 0]: -dir_y,
+                    pts[i, 1, 1]: -dir_y,
+                }
+            )
         self.geometry.nom_addShapeFunctionDV(dvName="shape", shapes=shapes)
 
         # setup the volume and thickness constraints
         leList = [[1e-4, 0.0, 1e-4], [1e-4, 0.0, 0.1 - 1e-4]]
         teList = [[0.998 - 1e-4, 0.0, 1e-4], [0.998 - 1e-4, 0.0, 0.1 - 1e-4]]
-        self.geometry.nom_addThicknessConstraints2D("thickcon", leList, teList, nSpan=2, nChord=10)
-        self.geometry.nom_addVolumeConstraint("volcon", leList, teList, nSpan=2, nChord=10)
+        self.geometry.nom_addThicknessConstraints2D(
+            "thickcon", leList, teList, nSpan=2, nChord=10
+        )
+        self.geometry.nom_addVolumeConstraint(
+            "volcon", leList, teList, nSpan=2, nChord=10
+        )
+        self.geometry.nom_addLERadiusConstraints(
+            "rcon", leList, 2, [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]
+        )
         # NOTE: we no longer need to define the sym and LE/TE constraints
         # because these constraints are defined in the above shape function
 
         # add the design variables to the dvs component's output
         self.dvs.add_output("shape", val=np.array([0] * len(shapes)))
         self.dvs.add_output("patchV", val=np.array([U0, aoa0]))
-        self.dvs.add_output("patchV_delta", val=np.array([U0, aoa0 + 0.01]))
-        # manually connect the dvs output to the geometry and cruise
-        self.connect("patchV", "cruise.patchV")
-        self.connect("patchV_delta", "cruise_delta.patchV")
+        # manually connect the dvs output to the geometry and scenario1
+        self.connect("patchV", "scenario1.patchV")
         self.connect("shape", "geometry.shape")
 
         # define the design variables to the top level
-        self.add_design_var("shape", lower=-1.0, upper=1.0, scaler=10.0)
+        self.add_design_var("shape", lower=-0.05, upper=0.05, scaler=10.0)
         # here we fix the U0 magnitude and allows the aoa to change
-        self.add_design_var("patchV", lower=[U0, 0.0], upper=[U0, 10.0], scaler=0.1)
-        self.add_design_var("patchV_delta", lower=[U0, 0.0], upper=[U0, 10.0], scaler=0.1)
+        self.add_design_var("patchV", lower=[0.0], upper=[5.0], scaler=0.1, indices=[1])
 
-        # here we use the CD_AVG defined above as the obj func.
-        self.add_objective("cruise.aero_post.CD", scaler=1.0)
-        self.add_constraint("cruise.aero_post.CL", equals=CL_target, scaler=1.0)
+        # add objective and constraints to the top level
+        self.add_objective("scenario1.aero_post.CD", scaler=1.0)
+        self.add_constraint("scenario1.aero_post.CL", equals=CL_target, scaler=1.0)
         self.add_constraint("geometry.thickcon", lower=0.5, upper=3.0, scaler=1.0)
         self.add_constraint("geometry.volcon", lower=1.0, scaler=1.0)
-
-        self.add_constraint("dCMZdAOA.val", upper=CMZ_upper, scaler=1.0)
-        self.connect("cruise_delta.aero_post.CMZ", "dCMZdAOA.CMZ_delta")
-        self.connect("cruise.aero_post.CMZ", "dCMZdAOA.CMZ")
-
-        self.add_constraint("patchVDelta.val", equals=[0.0, 0.01], scaler=1.0, linear=True)
-        self.connect("patchV", "patchVDelta.patchV")
-        self.connect("patchV_delta", "patchVDelta.patchV_delta")
+        self.add_constraint("geometry.rcon", lower=0.8, scaler=1.0)
 
 
 # OpenMDAO setup
@@ -225,71 +208,23 @@ prob.model = Top()
 prob.setup(mode="rev")
 om.n2(prob, show_browser=False, outfile="mphys.html")
 
-# initialize the optimization function
-optFuncs = OptFuncs(daOptions, prob)
-
-# use pyoptsparse to setup optimization
-prob.driver = om.pyOptSparseDriver()
-prob.driver.options["optimizer"] = args.optimizer
-# options for optimizers
-if args.optimizer == "SNOPT":
-    prob.driver.opt_settings = {
-        "Major feasibility tolerance": 1.0e-5,
-        "Major optimality tolerance": 1.0e-5,
-        "Minor feasibility tolerance": 1.0e-5,
-        "Verify level": -1,
-        "Function precision": 1.0e-5,
-        "Major iterations limit": 100,
-        "Nonderivative linesearch": None,
-        "Print file": "opt_SNOPT_print.txt",
-        "Summary file": "opt_SNOPT_summary.txt",
-    }
-elif args.optimizer == "IPOPT":
-    prob.driver.opt_settings = {
-        "tol": 1.0e-5,
-        "constr_viol_tol": 1.0e-5,
-        "max_iter": 100,
-        "print_level": 5,
-        "output_file": "opt_IPOPT.txt",
-        "mu_strategy": "adaptive",
-        "limited_memory_max_history": 10,
-        "nlp_scaling_method": "none",
-        "alpha_for_y": "full",
-        "recalc_y": "yes",
-    }
-elif args.optimizer == "SLSQP":
-    prob.driver.opt_settings = {
-        "ACC": 1.0e-5,
-        "MAXIT": 100,
-        "IFILE": "opt_SLSQP.txt",
-    }
-else:
-    print("optimizer arg not valid!")
-    exit(1)
-
-prob.driver.options["debug_print"] = ["nl_cons", "objs", "desvars"]
-prob.driver.options["print_opt_prob"] = True
-prob.driver.hist_file = "OptView.hst"
-
+prob.driver = modOptDriver(optimizer="Egor")
+# we must have this so maxiter will NOT overwirte max_iters
+prob.driver.options["maxiter"] = 30
+prob.driver.opt_settings = {
+    "n_start": 20,
+    "n_doe": 20,
+    "seed": 0,
+    "verbose": 1,
+    "outdir": "./",
+}
 
 if args.task == "run_driver":
-    # solve CL
-    # optFuncs.findFeasibleDesign(["scenario1.aero_post.CL"], ["patchV"], targets=[CL_target], designVarsComp=[1])
     # run the optimization
     prob.run_driver()
 elif args.task == "run_model":
     # just run the primal once
     prob.run_model()
-elif args.task == "compute_totals":
-    # just run the primal and adjoint once
-    prob.run_model()
-    totals = prob.compute_totals()
-    if MPI.COMM_WORLD.rank == 0:
-        print(totals)
-elif args.task == "check_totals":
-    # verify the total derivatives against the finite-difference
-    prob.run_model()
-    prob.check_totals(compact_print=False, step=1e-3, form="central", step_calc="abs")
 else:
     print("task arg not found!")
     exit(1)
